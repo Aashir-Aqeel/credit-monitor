@@ -1,103 +1,97 @@
-import os
-import asyncio
-import httpx
 import logging
-from datetime import datetime
-from app.utils.database import remaining_balance_collection, email_address_collection
-from app.utils.email_utils import send_email  # import your email function
+from datetime import datetime, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import time
+from app.utils.openai_utils import get_openai_usage
+from app.utils.database import remaining_credits, usage_collection  # your collections
 
-# Terminal logger
-logger = logging.getLogger("credit-monitor")
+logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY not found in environment variables!")
+def get_utc_day_bucket():
+    """Returns Unix timestamps aligned to previous UTC day"""
+    now_utc = datetime.utcnow()
+    start_utc = datetime(now_utc.year, now_utc.month, now_utc.day) - timedelta(days=1)
+    end_utc = start_utc + timedelta(days=1)
+    start_ts = int(start_utc.timestamp())
+    end_ts = int(end_utc.timestamp())
+    return start_ts, end_ts
 
-HEADERS = {
-    "Authorization": f"Bearer {OPENAI_API_KEY}"
-}
 
-# Threshold for sending alerts
-THRESHOLD = 10.0  # Example value
+
+logger = logging.getLogger(__name__)
+
+import logging
+import time
+from app.utils.openai_utils import get_openai_usage
+from app.utils.database import remaining_credits, usage_collection
+
+logger = logging.getLogger(__name__)
 
 async def check_user_credits():
-    """
-    Check OpenAI API usage, update remaining balance, and send alerts if below threshold.
-    """
+    logger.info("Starting check_user_credits job...")
+
+    # Fetch last saved usage document
+    last_usage_doc = await usage_collection.find_one(sort=[("timestamp", -1)])
+    last_saved_response = last_usage_doc.get("response") if last_usage_doc else None
+
+    # Fetch current usage from OpenAI (full response, not just a float)
+    usage_response = await get_openai_usage()
+    if not usage_response:
+        logger.warning("No usage returned from OpenAI")
+        return
+
+    logger.info(f"OpenAI usage fetched: {usage_response}")
+
+    # Calculate incremental usage
+    usage_diff = 0
     try:
-        logger.info("Running OpenAI cost monitor...")
+        # Sum amounts for last saved response
+        last_total = sum(
+            bucket["results"][0]["amount"]["value"]
+            for bucket in last_saved_response.get("data", [])
+        ) if last_saved_response else 0
 
-        # Fetch last saved balance
-        balance_doc = await remaining_balance_collection.find_one()
-        if not balance_doc:
-            logger.warning("No balance found in DB. Set initial balance via /update-balance API.")
-            return
-
-        last_balance = balance_doc.get("remaining_credits", 0)
-        last_api_value = balance_doc.get("last_api_value", 0)
-
-        # Call OpenAI API
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            start_time = int(datetime.utcnow().timestamp())
-            url = f"https://api.openai.com/v1/organization/costs?limit=1&start_time={start_time}"
-            response = await client.get(url, headers=HEADERS)
-            response.raise_for_status()
-            response_json = response.json()
-            logger.info(f"API response: {response_json}")
-
-        # Extract results safely
-        data = response_json.get("data")
-        if not data or not data[0].get("results"):
-            logger.warning("No usage data found in API response.")
-            return
-
-        results = data[0]["results"]
-        usage_value = results[0]["amount"]["value"]
-        usage_currency = results[0]["amount"]["currency"]
-
-        usage_diff = usage_value - last_api_value
-        if usage_diff < 0:
-            usage_diff = 0  # prevent negative deduction
-
-        new_balance = max(0, last_balance - usage_diff)
-
-        # Update DB
-        await remaining_balance_collection.update_one(
-            {"_id": balance_doc["_id"]},
-            {
-                "$set": {
-                    "remaining_credits": new_balance,
-                    "last_api_value": usage_value,
-                    "last_start_time": data[0]["start_time"],
-                    "last_end_time": data[0]["end_time"],
-                    "updated_at": datetime.utcnow()
-                }
-            }
+        # Sum amounts for current response
+        current_total = sum(
+        bucket["results"][0]["amount"]["value"]
+        for bucket in usage_response.get("data", [])
         )
-        logger.info(f"Updated remaining balance: {new_balance} {usage_currency} (usage diff: {usage_diff})")
 
-        # Check threshold and send alert emails if needed
-        if new_balance <= THRESHOLD:
-            logger.warning(f"Remaining balance {new_balance} is at or below threshold {THRESHOLD}. Sending alerts...")
-            # Fetch all emails from DB
-            async for doc in email_address_collection.find({}):
-                to_email = doc.get("email")
-                subject = "⚠️ OpenAI Credit Alert"
-                body = f"Your remaining OpenAI balance is {new_balance} {usage_currency}, which is at or below the threshold of {THRESHOLD}."
-                try:
-                    await send_email(to_email, subject, body)
-                    logger.info(f"Alert email sent to {to_email}")
-                except Exception as e:
-                    logger.error(f"Failed to send alert email to {to_email}: {e}")
 
-    except httpx.HTTPError as e:
-        logger.error(f"HTTP error while fetching OpenAI usage: {e}")
+        usage_diff = max(current_total - last_total, 0)
+        logger.info(f"Incremental usage since last check: ${usage_diff}")
+
     except Exception as e:
-        logger.error(f"Unexpected error in check_user_credits: {e}")
+        logger.warning(f"Failed to calculate incremental usage: {e}")
+        usage_diff = 0
+
+    # Save current usage response
+    await usage_collection.insert_one({
+        "timestamp": int(time.time()),
+        "response": usage_response
+    })
+    logger.info("Saved usage response to database")
+
+    # Update remaining balance
+    balance_doc = await remaining_credits.find_one()
+    if balance_doc:
+        new_balance = balance_doc.get("remaining_credits", 0) - usage_diff
+        await remaining_credits.update_one(
+            {"_id": balance_doc["_id"]},
+            {"$set": {"remaining_credits": new_balance}}
+        )
+        logger.info(f"Remaining balance updated → {new_balance}")
+    else:
+        # Initialize remaining balance if first-time
+        initial_balance = 1000  # Set your initial starting balance
+        await remaining_credits.insert_one({
+            "remaining_credits": initial_balance,
+        })
+        logger.info(f"Inserted first balance record → {initial_balance}")
 
 
-async def run_monitor():
-    """
-    Scheduled task to check user credits periodically.
-    """
-    await check_user_credits()
+
+# Scheduler
+scheduler = AsyncIOScheduler()
+scheduler.add_job(check_user_credits, "interval", minutes=0.5)
+scheduler.start()

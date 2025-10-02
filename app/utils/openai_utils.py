@@ -1,67 +1,36 @@
-import requests
-from datetime import datetime, timedelta
+import os
+import aiohttp
+import logging
 
-def get_openai_usage(api_key: str, days: int = 1):
+logger = logging.getLogger(__name__)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+print(f"OPENAI_API_KEY: {OPENAI_API_KEY}")
+OPENAI_BASE = "https://api.openai.com/v1"
+
+async def get_openai_usage():
     """
-    Fetch OpenAI API usage for the last `days` days.
-    Default: today's usage (days=1).
+    Fetch usage from OpenAI organization/costs API.
+    Returns the full response dict (not a float).
     """
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=days - 1)
-
-    url = f"https://api.openai.com/v1/dashboard/billing/usage?start_date={start_date}&end_date={end_date}"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    response = requests.get(url, headers=headers)
-
-    if response.status_code == 200:
-        data = response.json()
-        total_used = data.get("total_usage", 0) / 100.0  # API returns in cents
-        return total_used
-    else:
-        raise Exception(f"Failed to fetch usage: {response.status_code} - {response.text}")
-
-
-def get_openai_subscription(api_key: str):
-    """
-    Fetch OpenAI subscription info (hard limit & expiry).
-    """
-    url = "https://api.openai.com/v1/dashboard/billing/subscription"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    response = requests.get(url, headers=headers)
-
-    if response.status_code == 200:
-        data = response.json()
-        hard_limit = data.get("hard_limit_usd", 0.0)
-        return hard_limit
-    else:
-        raise Exception(f"Failed to fetch subscription: {response.status_code} - {response.text}")
-
-
-def get_openai_report(api_key: str):
-    """
-    Build a usage report with today's, monthly usage, and remaining balance.
-    """
-    today_usage = get_openai_usage(api_key, days=1)
-
-    # Monthly usage: from 1st of current month to today
-    start_of_month = datetime.utcnow().replace(day=1).date()
-    end_date = datetime.utcnow().date()
-    url = f"https://api.openai.com/v1/dashboard/billing/usage?start_date={start_of_month}&end_date={end_date}"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    response = requests.get(url, headers=headers)
-
-    monthly_usage = 0.0
-    if response.status_code == 200:
-        data = response.json()
-        monthly_usage = data.get("total_usage", 0) / 100.0
-
-    # Subscription / hard limit
-    total_limit = get_openai_subscription(api_key)
-    remaining_balance = total_limit - monthly_usage
-
-    return {
-        "today_usage": today_usage,
-        "monthly_usage": monthly_usage,
-        "total_limit": total_limit,
-        "remaining_balance": remaining_balance
+    url = "https://api.openai.com/v1/organization/costs?start_time=1758844800&end_time=1759104000"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
     }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.warning(f"OpenAI usage request failed: {resp.status} - {text}")
+                    return {}
+
+                data = await resp.json()
+                logger.info(f"OpenAI usage data: {data}")
+
+                return data  # Return the full response
+
+    except Exception as e:
+        logger.exception(f"Exception while fetching OpenAI usage: {e}")
+        return {}

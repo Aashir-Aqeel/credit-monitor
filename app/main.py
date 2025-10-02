@@ -4,10 +4,10 @@ from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 load_dotenv()
-from app.utils.database import remaining_balance_collection, email_address_collection
+from app.utils.database import remaining_credits, email_address_collection
 from app.services.monitor import check_user_credits
-from app.services.monitor import run_monitor
 from datetime import datetime
+from typing import Optional
 
 
 
@@ -29,9 +29,11 @@ app = FastAPI(title="API Credit Monitor")
 # ---------------------------------------------------------
 # Models
 # ---------------------------------------------------------
+
 class BalanceInput(BaseModel):
-    remaining_balance_collection: float
-    threshold: float
+    remaining_credits: Optional[float] = None
+    threshold: Optional[float] = None  # ✅ Make it optional with default
+
 
 class EmailInput(BaseModel):
     email: str
@@ -47,35 +49,53 @@ async def root():
 async def update_balance(data: BalanceInput):
     """Update remaining balance & threshold in DB and initialize usage tracking"""
     try:
-        # Delete any previous balance document (keep only one)
-        await remaining_balance_collection.delete_many({})
+        # Get the existing balance document (assuming only one exists)
+        existing_doc = await remaining_credits.find_one({})
 
-        # Initialize last_usage_value and last_checked_timestamp
-        initial_doc = {
-            "remaining_credits": data.remaining_balance_collection,
-            "threshold": data.threshold,
-            "last_usage_value": 0.0,  # first API hit will update this
-            "last_checked": None,
-            "last_checked_timestamp": int(datetime.now().timestamp())  # use current timestamp
-        }
+        if existing_doc is None:
+            # If no document exists, create one with defaults
+            initial_doc = {
+                "remaining_credits": data.remaining_credits if data.remaining_credits is not None else 0.0,
+                "threshold": data.threshold if data.threshold is not None else 0.0,
+                "last_usage_value": 0.0,
+                "last_checked": None,
+                "last_checked_timestamp": int(datetime.now().timestamp())
+            }
+            result = await remaining_credits.insert_one(initial_doc)
+            logger.info(f"Balance initialized → {initial_doc}")
+            return {"status": "success", "balance_id": str(result.inserted_id)}
 
-        result = await remaining_balance_collection.insert_one(initial_doc)
-        logger.info(f"Balance updated → {data.remaining_balance_collection}, threshold: {data.threshold}")
-        return {"status": "success", "balance_id": str(result.inserted_id)}
+        # Prepare update dict with only provided fields
+        update_dict = {}
+        if data.remaining_credits is not None:
+            update_dict["remaining_credits"] = data.remaining_credits
+        if data.threshold is not None:
+            update_dict["threshold"] = data.threshold
+        update_dict["last_checked_timestamp"] = int(datetime.now().timestamp())
+
+        # Update the document
+        await remaining_credits.update_one(
+            {"_id": existing_doc["_id"]},
+            {"$set": update_dict}
+        )
+        logger.info(f"Balance updated → {update_dict}")
+        return {"status": "success", "updated_fields": update_dict}
+
     except Exception as e:
         logger.error(f"Error updating balance: {e}")
         raise HTTPException(status_code=500, detail="Failed to update balance")
+ 
 
 
 
 @app.get("/balance")
 async def get_balance():
     """Get current balance and threshold"""
-    doc = await remaining_balance_collection.find_one()
+    doc = await remaining_credits.find_one()
     if not doc:
         raise HTTPException(status_code=404, detail="No balance found")
     return {
-        "remaining_balance_collection": doc.get("remaining_credits", 0),
+        "remaining_credits": doc.get("remaining_credits", 0),
         "threshold": doc.get("threshold", 0),
     }
 
@@ -103,7 +123,7 @@ scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def start_scheduler():
-    scheduler.add_job(run_monitor, "interval", minutes=1)  # 🔥 every 6 hours
+    scheduler.add_job(check_user_credits, "interval", minutes=1)  # 🔥 every 6 hours
     scheduler.start()
     logger.info("Scheduler started (runs every 6 hours)")
 

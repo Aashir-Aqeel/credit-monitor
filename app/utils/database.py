@@ -8,8 +8,6 @@ client = AsyncIOMotorClient(MONGO_URI)
 db = client[DB_NAME]
 
 # ✅ Define the collections properly
-remaining_balance_collection = db["remaining_balance"]
+remaining_credits = db["remaining_balance"]
 email_address_collection = db["email_address"]
-
-print("DEBUG - database.py loaded successfully")
-print("DEBUG - collections:", remaining_balance_collection.name, email_address_collection.name)
+usage_collection = db["usage_records"]
